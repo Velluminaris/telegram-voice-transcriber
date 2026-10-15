@@ -6,18 +6,15 @@ from pathlib import Path
 
 import requests
 import soundfile as sf
+import numpy as np
+from scipy.signal import resample_poly
 from vosk import Model, KaldiRecognizer, SetLogLevel
 
 # ── Настройки ──────────────────────────────────────────────
-# Папка, куда нужно просто скидывать голосовые сообщения
 INPUT_DIR = Path(__file__).parent / "voices"
 
 MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
 MODEL_NAME = "vosk-model-small-ru-0.22"
-
-# Большая модель (~1.8 GB, точнее) — раскомментируй при необходимости:
-# MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip"
-# MODEL_NAME = "vosk-model-ru-0.42"
 
 MODEL_DIR = Path(__file__).parent / "model"
 SAMPLE_RATE = 16000
@@ -67,26 +64,46 @@ def ensure_model() -> str:
     return str(model_path)
 
 
-# ── Конвертация ────────────────────────────────────────────
-def ogg_to_wav(ogg_path: str) -> str:
-    """Telegram .ogg (Opus) → 16 kHz mono WAV для Vosk."""
-    audio, sr = sf.read(ogg_path, dtype='int16')
-    
-    if sr != SAMPLE_RATE:
-        import numpy as np
-        duration = len(audio) / sr
-        new_length = int(duration * SAMPLE_RATE)
-        audio = np.interp(
-            np.linspace(0, len(audio), new_length),
-            np.arange(len(audio)),
-            audio
-        ).astype('int16')
-    
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1).astype('int16')
-    
+# ── Конвертация и очистка ──────────────────────────────────
+def process_audio_for_vosk(ogg_path: str) -> str:
+    """
+    1. Качественно меняет частоту дискретизации (без артефактов np.interp).
+    2. Применяет математический шумовой гейт для удаления фонового шума.
+    3. Сохраняет в формат, идеальный для Vosk.
+    """
     wav_path = str(Path(ogg_path).with_suffix(".wav"))
-    sf.write(wav_path, audio, SAMPLE_RATE, subtype='PCM_16')
+    
+    # 1. Читаем аудио как float32 для точных математических операций
+    audio, sr = sf.read(ogg_path, dtype='float32')
+    
+    # Если аудио стерео, делаем моно
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+    
+    # 2. Качественный ресемплинг (полифазный фильтр, стандарт индустрии)
+    if sr != SAMPLE_RATE:
+        audio = resample_poly(audio, SAMPLE_RATE, sr)
+    
+    # 3. Шумовой гейт на чистом NumPy (замена тихого шума на абсолютную тишину)
+    # Порог -20 dB: всё, что тише этого уровня, считается фоновым шумом и обнуляется
+    threshold_db = -20.0
+    threshold_linear = 10 ** (threshold_db / 20.0)
+    
+    frame_length = int(SAMPLE_RATE * 0.02)  # 20 мс, как в профессиональных VAD
+    hop_length = frame_length // 2
+    
+    output = np.copy(audio)
+    for i in range(0, len(audio) - frame_length, hop_length):
+        frame = audio[i:i + frame_length]
+        rms = np.sqrt(np.mean(frame ** 2))  # Среднеквадратичная амплитуда (громкость)
+        
+        if rms < threshold_linear:
+            output[i:i + frame_length] = 0.0  # Заменяем шум на тишину
+
+    # 4. Конвертируем обратно в 16-bit PCM для Vosk
+    audio_int16 = np.clip(output * 32767, -32768, 32767).astype('int16')
+    sf.write(wav_path, audio_int16, SAMPLE_RATE, subtype='PCM_16')
+    
     return wav_path
 
 
@@ -98,12 +115,16 @@ def transcribe(audio_path: str) -> str:
     rec = KaldiRecognizer(model, SAMPLE_RATE)
 
     wav_path = None
-    if audio_path.lower().endswith(".ogg"):
-        wav_path = ogg_to_wav(audio_path)
-        audio_path = wav_path
-
+    
     try:
-        wf = wave.open(audio_path, "rb")
+        # Если это ogg, конвертируем и чистим шум
+        if audio_path.lower().endswith(".ogg"):
+            wav_path = process_audio_for_vosk(audio_path)
+            process_path = wav_path
+        else:
+            process_path = audio_path
+
+        wf = wave.open(process_path, "rb")
         chunks = []
 
         while True:
@@ -122,6 +143,7 @@ def transcribe(audio_path: str) -> str:
         wf.close()
         return " ".join(chunks).strip()
     finally:
+        # Удаляем временный WAV файл после обработки
         if wav_path and Path(wav_path).exists():
             Path(wav_path).unlink()
 
@@ -135,11 +157,10 @@ def get_target_files(limit: int = None) -> list[Path]:
     if not files:
         return []
     
-    # Сортировка по имени (для audio_YYYY-MM-DD_HH-MM-SS.ogg это хронологический порядок)
     files.sort(key=lambda p: p.name)
     
     if limit is not None:
-        return files[-limit:]  # Берем последние N файлов
+        return files[-limit:]
     
     return files
 
@@ -157,12 +178,10 @@ def process_single_file(file_path: Path):
 
 # ── CLI (Командная строка) ─────────────────────────────────
 if __name__ == "__main__":
-    # Сразу проверяем модель, чтобы не прерывать процесс скачиванием посередине
     print("🔄 Проверка модели...")
     ensure_model()
 
     if len(sys.argv) == 1:
-        # Режим 1: Обработать ВСЕ файлы в папке voices
         files = get_target_files()
         if not files:
             print(f"📁 Папка '{INPUT_DIR}' пуста или не содержит .ogg файлов.")
@@ -177,7 +196,6 @@ if __name__ == "__main__":
         arg = sys.argv[1]
         
         if arg.isdigit():
-            # Режим 2: Обработать последние N файлов
             limit = int(arg)
             files = get_target_files(limit=limit)
             if not files:
@@ -188,10 +206,8 @@ if __name__ == "__main__":
             for f in files:
                 process_single_file(f)
         else:
-            # Режим 3: Обработать конкретный файл по имени или пути
             target_path = Path(arg)
             
-            # Если файла нет в текущей папке, проверяем папку voices
             if not target_path.exists():
                 alt_path = INPUT_DIR / arg
                 if alt_path.exists():
@@ -207,5 +223,5 @@ if __name__ == "__main__":
         print("\n📘 Использование:")
         print("  python transcribe.py          # обработать все .ogg в папке 'voices'")
         print("  python transcribe.py N        # обработать последние N файлов в папке 'voices'")
-        print("  python transcribe.py file.ogg # обработать конкретный файл (из текущей папки или 'voices')")
+        print("  python transcribe.py file.ogg # обработать конкретный файл")
         sys.exit(1)
